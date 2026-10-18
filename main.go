@@ -264,6 +264,17 @@ func main() {
 		"127.0.0.1": true,
 		"localhost": true,
 	}
+	// Extra hostnames served through a reverse proxy, e.g. a Cloudflare
+	// tunnel: ACP_MOBILE_ALLOWED_HOSTS=agents.example.com,other.example.com
+	var publicHost string
+	for _, h := range strings.Split(os.Getenv("ACP_MOBILE_ALLOWED_HOSTS"), ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			allowedHosts[h] = true
+			if publicHost == "" {
+				publicHost = h
+			}
+		}
+	}
 	ts, tsErr := tailscaleSelf()
 	if tsErr == nil {
 		allowedHosts[ts.Hostname] = true
@@ -334,6 +345,9 @@ func main() {
 	link := fmt.Sprintf("http://127.0.0.1:%s?authkey=%s", port, authKey)
 	if tsErr == nil {
 		link = fmt.Sprintf("http://%s:%s?authkey=%s", ts.Hostname, port, authKey)
+	}
+	if publicHost != "" {
+		link = fmt.Sprintf("https://%s/?authkey=%s", publicHost, authKey)
 	}
 	log.Printf("acp-mobile: %s", link)
 	linkPath := filepath.Join(filepath.Dir(authKeyPath()), "link")
