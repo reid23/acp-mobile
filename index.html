@@ -1728,6 +1728,12 @@ function handleMessage(msg) {
     addPermissionMsg(msg, true);
     return;
   }
+  if (msg.method && msg.id !== undefined && msg.method.startsWith('cursor/')) {
+    // Answered by the Emacs primary; replying here would win the race
+    // (e.g. auto-accepting cursor/create_plan).
+    if (msg.method === 'cursor/create_plan') addSystemMsg('Plan awaiting approval in Emacs');
+    return;
+  }
   if (msg.method && msg.id !== undefined) {
     // Unknown reverse call — respond with error so agent doesn't hang
     ws.send(JSON.stringify({
