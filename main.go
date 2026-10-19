@@ -299,6 +299,13 @@ func main() {
 		if h, _, err := net.SplitHostPort(clientIP); err == nil {
 			clientIP = h
 		}
+		// Behind a local Cloudflare tunnel every request comes from loopback.
+		if ip := net.ParseIP(clientIP); ip != nil && ip.IsLoopback() {
+			if cf := r.Header.Get("Cf-Connecting-Ip"); cf != "" {
+				clientIP = cf
+			}
+		}
+		viaHTTPS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 
 		// Auth: if authkey query param is present and valid, set cookie and redirect
 		if qk := r.URL.Query().Get("authkey"); qk != "" {
@@ -316,7 +323,10 @@ func main() {
 				Value:    authKey,
 				Path:     "/",
 				HttpOnly: true,
-				SameSite: http.SameSiteStrictMode,
+				Secure:   viaHTTPS,
+				// Lax, not Strict: arriving from an SSO login (e.g. Cloudflare
+				// Access) is a cross-site navigation, which Strict cookies skip.
+				SameSite: http.SameSiteLaxMode,
 			})
 			// Redirect to strip authkey from URL
 			q := r.URL.Query()
@@ -328,7 +338,12 @@ func main() {
 
 		// Auth: check cookie
 		cookie, err := r.Cookie("authkey")
-		if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(authKey)) != 1 {
+		if err != nil {
+			// No key offered is not a guess; don't count it toward lockout.
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(authKey)) != 1 {
 			if authRL.check(clientIP) {
 				http.Error(w, "too many failed attempts, try again later", http.StatusTooManyRequests)
 				return
