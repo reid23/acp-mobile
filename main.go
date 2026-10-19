@@ -275,6 +275,14 @@ func main() {
 			}
 		}
 	}
+	// Accept Cloudflare Access logins in place of the authkey:
+	// ACP_MOBILE_CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com
+	// ACP_MOBILE_CF_ACCESS_AUD=<application AUD tag>
+	var cfAuth *cfAccess
+	if team, aud := os.Getenv("ACP_MOBILE_CF_ACCESS_TEAM_DOMAIN"), os.Getenv("ACP_MOBILE_CF_ACCESS_AUD"); team != "" && aud != "" {
+		cfAuth = newCFAccess(team, aud)
+		log.Printf("acp-mobile: accepting Cloudflare Access tokens from %s", cfAuth.issuer)
+	}
 	ts, tsErr := tailscaleSelf()
 	if tsErr == nil {
 		allowedHosts[ts.Hostname] = true
@@ -306,6 +314,11 @@ func main() {
 			}
 		}
 		viaHTTPS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+
+		if cfAuth != nil && cfAuth.authorized(r) {
+			mux.ServeHTTP(w, r)
+			return
+		}
 
 		// Auth: if authkey query param is present and valid, set cookie and redirect
 		if qk := r.URL.Query().Get("authkey"); qk != "" {
