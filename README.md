@@ -51,6 +51,8 @@ Sessions under a current acp-multiplex report their state exactly (see acp-multi
 
 The `+` buttons run `agent-shell-spawn` (looked up in `extraPath` from `~/.acp-mobile/config.json`, then `PATH`). Under systemd, make sure the unit's `PATH` includes the directories holding `agent-shell-spawn` and `emacsclient`.
 
+It is called as `agent-shell-spawn [--model MODEL] [--effort EFFORT] -- NAME DIR [TASK]`. The model and effort choices in the new-agent panel are the `model` and `thought_level` config options advertised by running sessions; with none running, the agent's defaults are used.
+
 ## Stopping acp-mobile
 
 Don't use `pkill -f acp-mobile` — on macOS, `-f` can match unrelated processes (confirmed empirically: `pgrep -f acp-mobile` matches claude agent processes). Best guess is that node's `process.title` argv rewriting causes `pgrep -f` to search into environment variable data in `KERN_PROCARGS2`. Use `pkill -x acp-mobile` instead.
