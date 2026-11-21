@@ -693,3 +693,85 @@ func TestPermissionReplayInteractive(t *testing.T) {
 
 	_ = fmt.Sprintf // avoid unused import
 }
+
+func TestHandleDirs(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"beta", "alpha", ".hidden"} {
+		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "alpha"), filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(path string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"path": path})
+		recorder := httptest.NewRecorder()
+		handleDirs(recorder, httptest.NewRequest(http.MethodPost, "/api/dirs", strings.NewReader(string(body))))
+		return recorder
+	}
+
+	recorder := post(root + "/beta/..")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", recorder.Code, recorder.Body)
+	}
+	var response struct {
+		Path string   `json:"path"`
+		Dirs []string `json:"dirs"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Path != root {
+		t.Errorf("path = %q, want %q", response.Path, root)
+	}
+	if want := []string{"alpha", "beta", "linked"}; fmt.Sprint(response.Dirs) != fmt.Sprint(want) {
+		t.Errorf("dirs = %v, want %v", response.Dirs, want)
+	}
+
+	if code := post("relative/path").Code; code != http.StatusBadRequest {
+		t.Errorf("relative path: status %d, want %d", code, http.StatusBadRequest)
+	}
+	if code := post(filepath.Join(root, "file.txt")).Code; code != http.StatusNotFound {
+		t.Errorf("file path: status %d, want %d", code, http.StatusNotFound)
+	}
+}
+
+func TestHandleSpawnPassesModelAndEffort(t *testing.T) {
+	binDir := t.TempDir()
+	argsFile := filepath.Join(binDir, "args")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "agent-shell-spawn"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	savedConfig := appConfig
+	appConfig.ExtraPath = []string{binDir}
+	t.Cleanup(func() { appConfig = savedConfig })
+
+	cases := []struct {
+		request string
+		want    []string
+	}{
+		{`{"name":"n","cwd":"/tmp"}`, []string{"--", "n", "/tmp"}},
+		{`{"name":"n","cwd":"/tmp","task":"do it","model":"opus","effort":"high"}`,
+			[]string{"--model", "opus", "--effort", "high", "--", "n", "/tmp", "do it"}},
+	}
+	for _, testCase := range cases {
+		recorder := httptest.NewRecorder()
+		handleSpawn(recorder, httptest.NewRequest(http.MethodPost, "/api/spawn", strings.NewReader(testCase.request)))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", testCase.request, recorder.Code, recorder.Body)
+		}
+		written, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Split(strings.TrimSuffix(string(written), "\n"), "\n"); fmt.Sprint(got) != fmt.Sprint(testCase.want) {
+			t.Errorf("%s: args = %q, want %q", testCase.request, got, testCase.want)
+		}
+	}
+}

@@ -274,6 +274,7 @@ func main() {
 	mux.HandleFunc("/api/sessions", handleSessions)
 	mux.HandleFunc("/api/spawn", handleSpawn)
 	mux.HandleFunc("/api/kill", handleKill)
+	mux.HandleFunc("/api/dirs", handleDirs)
 	mux.HandleFunc("/files/list", handleFileList)
 	mux.HandleFunc("/files/read", handleFileRead)
 
@@ -533,6 +534,18 @@ type sessionInfo struct {
 	// idle, working or awaiting_input; empty if the probe didn't finish.
 	State      string `json:"state,omitempty"`
 	StateSince int64  `json:"stateSince,omitempty"`
+	// The agent's model and thought_level options, offered when spawning.
+	SpawnOptions []configOption `json:"spawnOptions,omitempty"`
+}
+
+// configOption is an ACP session config option (a select).
+type configOption struct {
+	ID       string `json:"id"`
+	Category string `json:"category"`
+	Options  []struct {
+		Value string `json:"value"`
+		Name  string `json:"name"`
+	} `json:"options"`
 }
 
 func handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -599,9 +612,11 @@ func handleSpawn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Cwd  string `json:"cwd"`
-		Name string `json:"name"`
-		Task string `json:"task"`
+		Cwd    string `json:"cwd"`
+		Name   string `json:"name"`
+		Task   string `json:"task"`
+		Model  string `json:"model"`
+		Effort string `json:"effort"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -612,7 +627,14 @@ func handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	args := []string{req.Name, req.Cwd}
+	var args []string
+	if req.Model != "" {
+		args = append(args, "--model", req.Model)
+	}
+	if req.Effort != "" {
+		args = append(args, "--effort", req.Effort)
+	}
+	args = append(args, "--", req.Name, req.Cwd)
 	if req.Task != "" {
 		args = append(args, req.Task)
 	}
@@ -760,11 +782,17 @@ func probeSocket(sockPath string, pid int, mtime int64) sessionInfo {
 				Title string `json:"title"`
 				Name  string `json:"name"`
 			} `json:"agentInfo"`
-			SessionID string `json:"sessionId"`
-			Cwd       string `json:"cwd"`
+			SessionID     string         `json:"sessionId"`
+			Cwd           string         `json:"cwd"`
+			ConfigOptions []configOption `json:"configOptions"`
 		}
 		if json.Unmarshal(msg.Result, &res) != nil {
 			continue
+		}
+		for _, option := range res.ConfigOptions {
+			if option.Category == "model" || option.Category == "thought_level" {
+				info.SpawnOptions = append(info.SpawnOptions, option)
+			}
 		}
 
 		if res.AgentInfo != nil {
@@ -1085,6 +1113,65 @@ func isUnderRoots(absPath string, roots []string) bool {
 		}
 	}
 	return false
+}
+
+// handleDirs lists the subdirectories of a directory for the spawn
+// directory picker.  It is not limited to session roots: /api/spawn can
+// already start an agent in any directory.
+func handleDirs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	dirPath := req.Path
+	if dirPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		dirPath = home
+	}
+	if !filepath.IsAbs(dirPath) {
+		http.Error(w, "path must be absolute", http.StatusBadRequest)
+		return
+	}
+	dirPath = filepath.Clean(dirPath)
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	dirs := []string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		isDir := entry.IsDir()
+		if entry.Type()&os.ModeSymlink != 0 {
+			info, err := os.Stat(filepath.Join(dirPath, name))
+			isDir = err == nil && info.IsDir()
+		}
+		if isDir {
+			dirs = append(dirs, name)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"path": dirPath,
+		"dirs": dirs,
+	})
 }
 
 type fileEntry struct {

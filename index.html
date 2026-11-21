@@ -517,6 +517,52 @@ body {
 }
 .msg.agent .md p { margin: 4px 0; }
 .msg.agent .md { color: #fff; font-size: 15px; line-height: 22px; }
+
+/* New agent panel */
+#spawn-panel {
+  display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: #121212; z-index: 100; flex-direction: column;
+}
+#spawn-panel.visible { display: flex; }
+#sp-header {
+  display: flex; align-items: center; padding: 10px 12px;
+  background: #1e1e1e; border-bottom: 1px solid #333; gap: 8px;
+}
+#sp-header .sp-title { flex: 1; font-size: 17px; font-weight: 600; color: #fff; }
+#sp-header button {
+  background: transparent; border: none; color: #007AFF;
+  font-size: 16px; cursor: pointer; padding: 4px 8px;
+}
+#sp-header #sp-cancel { color: #888; font-size: 20px; }
+#sp-header #sp-start { font-weight: 600; }
+#sp-header #sp-start:disabled { color: #555; }
+#sp-body {
+  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 12px 16px; display: flex; flex-direction: column; gap: 14px;
+}
+.sp-label { font-size: 12px; color: #888; text-transform: uppercase; margin-bottom: 6px; }
+#sp-path {
+  font-family: "SF Mono", Menlo, monospace; font-size: 13px; color: #e6edf3;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: left;
+}
+#sp-recent { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+#sp-recent button {
+  background: #1e1e1e; border: 1px solid #333; border-radius: 14px;
+  color: #ccc; font-size: 13px; padding: 5px 10px; cursor: pointer;
+}
+#sp-dirs {
+  max-height: 40vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  border: 1px solid #333; border-radius: 8px; margin-top: 8px;
+}
+#sp-dirs .fb-item { padding: 10px 12px; }
+#spawn-panel input, #spawn-panel select, #spawn-panel textarea {
+  width: 100%; background: #1e1e1e; border: 1px solid #333; border-radius: 8px;
+  color: #e6edf3; font-size: 16px; padding: 10px; font-family: inherit;
+}
+#spawn-panel textarea { resize: vertical; min-height: 80px; }
+.sp-row { display: flex; gap: 10px; }
+.sp-row > div { flex: 1; min-width: 0; }
 </style>
 </head>
 <body>
@@ -528,6 +574,33 @@ body {
     <button class="nav-btn" id="refresh-btn">&#8635;</button>
   </div>
   <div id="nav-list"></div>
+</div>
+<div id="spawn-panel">
+  <div id="sp-header">
+    <button id="sp-cancel">&times;</button>
+    <span class="sp-title">New agent</span>
+    <button id="sp-start">Start</button>
+  </div>
+  <div id="sp-body">
+    <div>
+      <div class="sp-label">Directory</div>
+      <div id="sp-path"></div>
+      <div id="sp-recent"></div>
+      <div id="sp-dirs"></div>
+    </div>
+    <div>
+      <div class="sp-label">Name</div>
+      <input id="sp-name" autocomplete="off" autocapitalize="off" enterkeyhint="done">
+    </div>
+    <div class="sp-row">
+      <div><div class="sp-label">Model</div><select id="sp-model"></select></div>
+      <div><div class="sp-label">Effort</div><select id="sp-effort"></select></div>
+    </div>
+    <div>
+      <div class="sp-label">Initial task (optional)</div>
+      <textarea id="sp-task"></textarea>
+    </div>
+  </div>
 </div>
 <div id="chat-view">
 <div id="header">
@@ -2387,7 +2460,7 @@ function renderSessions(sessions) {
     const addBtn = document.createElement('button');
     addBtn.className = 'ph-add';
     addBtn.textContent = '+';
-    addBtn.onclick = (e) => { e.stopPropagation(); spawnInProject(group[0].cwd); };
+    addBtn.onclick = (e) => { e.stopPropagation(); openSpawnPanel(group[0].cwd); };
     header.appendChild(addBtn);
     groupEl.appendChild(header);
 
@@ -2516,46 +2589,111 @@ function navigateBack() {
   showNavigator();
 }
 
-async function spawnAgent() {
-  // Get a cwd to spawn into — use first session's cwd or prompt
-  let cwd = '';
-  if (lastSessions.length > 0) {
-    // Pick from existing project cwds
-    const cwds = [...new Set(lastSessions.map(s => s.cwd).filter(Boolean))];
-    if (cwds.length > 0) {
-      const choice = window.prompt(
-        'Project directory:\n' + cwds.map((c, i) => (i + 1) + '. ' + shortPath(c)).join('\n') +
-        '\n\nEnter number or full path:',
-        cwds.length === 1 ? '1' : '');
-      if (!choice) return;
-      const num = parseInt(choice);
-      cwd = (num >= 1 && num <= cwds.length) ? cwds[num - 1] : choice;
+// --- New agent panel ---
+
+const spawnPanelEl = document.getElementById('spawn-panel');
+const spawnPathEl = document.getElementById('sp-path');
+const spawnDirsEl = document.getElementById('sp-dirs');
+const spawnNameEl = document.getElementById('sp-name');
+const spawnModelEl = document.getElementById('sp-model');
+const spawnEffortEl = document.getElementById('sp-effort');
+const spawnTaskEl = document.getElementById('sp-task');
+const spawnStartBtn = document.getElementById('sp-start');
+let spawnDirectory = '';
+
+// startDirectory empty means the server's home directory.
+function openSpawnPanel(startDirectory) {
+  spawnNameEl.value = '';
+  spawnTaskEl.value = '';
+
+  const recentEl = document.getElementById('sp-recent');
+  recentEl.innerHTML = '';
+  for (const cwd of new Set(lastSessions.map(s => s.cwd).filter(Boolean))) {
+    const chip = document.createElement('button');
+    chip.textContent = cwd.split('/').pop() || cwd;
+    chip.title = cwd;
+    chip.onclick = () => spawnNavigate(cwd);
+    recentEl.appendChild(chip);
+  }
+
+  // Choices come from what live agents advertise; with none running the
+  // agent's own default is used.
+  for (const [selectEl, category] of [[spawnModelEl, 'model'], [spawnEffortEl, 'thought_level']]) {
+    const options = lastSessions.flatMap(s => s.spawnOptions || [])
+      .find(o => o.category === category)?.options || [];
+    selectEl.innerHTML = '';
+    for (const option of options.length ? options : [{ value: '', name: 'Default' }]) {
+      const optionEl = document.createElement('option');
+      optionEl.value = option.value;
+      optionEl.textContent = option.name || option.value;
+      selectEl.appendChild(optionEl);
     }
-  }
-  if (!cwd) {
-    cwd = window.prompt('Project directory (full path):');
-    if (!cwd) return;
+    selectEl.disabled = !options.length;
   }
 
-  const name = window.prompt('Agent name:');
-  if (!name) return;
+  spawnPanelEl.classList.add('visible');
+  spawnNavigate(startDirectory);
+}
 
-  const task = window.prompt('Initial task (optional):') || '';
+function closeSpawnPanel() {
+  spawnPanelEl.classList.remove('visible');
+}
 
+async function spawnNavigate(directory) {
+  spawnDirsEl.innerHTML = '<div style="padding:12px;color:#888">Loading...</div>';
+  try {
+    const resp = await fetch(basePath + '/api/dirs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ path: directory })
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const data = await resp.json();
+    spawnDirectory = data.path;
+    spawnPathEl.textContent = data.path;
+    spawnDirsEl.innerHTML = '';
+    const rows = data.path === '/' ? data.dirs : ['..', ...data.dirs];
+    for (const name of rows) {
+      const row = document.createElement('div');
+      row.className = 'fb-item dir';
+      row.innerHTML = '<span class="fb-icon">' + (name === '..' ? '\u2191' : '\uD83D\uDCC1') +
+        '</span><span class="fb-name"></span>';
+      row.querySelector('.fb-name').textContent = name;
+      row.onclick = () => spawnNavigate(name === '..'
+        ? (data.path.replace(/\/[^/]+$/, '') || '/')
+        : data.path.replace(/\/$/, '') + '/' + name);
+      spawnDirsEl.appendChild(row);
+    }
+  } catch (err) {
+    spawnDirsEl.innerHTML = '';
+    showToast('Could not list directory: ' + err.message);
+  }
+}
+
+async function submitSpawn() {
+  const name = spawnNameEl.value.trim();
+  if (!name) { spawnNameEl.focus(); showToast('Give the agent a name'); return; }
+  spawnStartBtn.disabled = true;
   try {
     const resp = await fetch(basePath + '/api/spawn', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ cwd, name, task })
+      body: JSON.stringify({
+        cwd: spawnDirectory,
+        name,
+        task: spawnTaskEl.value,
+        model: spawnModelEl.value,
+        effort: spawnEffortEl.value,
+      })
     });
     const data = await resp.json();
-    if (data.error) {
-      alert('Spawn failed: ' + data.error);
-      return;
-    }
+    if (data.error) { alert('Spawn failed: ' + data.error); return; }
+    closeSpawnPanel();
     pollForNewSession();
   } catch (err) {
     alert('Spawn failed: ' + err.message);
+  } finally {
+    spawnStartBtn.disabled = false;
   }
 }
 
@@ -2583,22 +2721,6 @@ async function killSession() {
   } catch (err) {
     alert('Kill failed: ' + err.message);
   }
-}
-
-async function spawnInProject(cwd) {
-  const name = window.prompt('Agent name:');
-  if (!name) return;
-  const task = window.prompt('Initial task (optional):') || '';
-  try {
-    const resp = await fetch(basePath + '/api/spawn', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ cwd, name, task })
-    });
-    const data = await resp.json();
-    if (data.error) { alert('Spawn failed: ' + data.error); return; }
-    pollForNewSession();
-  } catch (err) { alert('Spawn failed: ' + err.message); }
 }
 
 function pollForNewSession() {
@@ -2629,7 +2751,9 @@ async function killSessionByName(bufferName) {
 
 // Wire up event listeners (no inline onclick for CSP compatibility)
 document.getElementById('sort-btn').addEventListener('click', toggleSort);
-document.getElementById('spawn-btn').addEventListener('click', spawnAgent);
+document.getElementById('spawn-btn').addEventListener('click', () => openSpawnPanel(''));
+document.getElementById('sp-cancel').addEventListener('click', closeSpawnPanel);
+spawnStartBtn.addEventListener('click', submitSpawn);
 document.getElementById('refresh-btn').addEventListener('click', () => loadSessions());
 document.getElementById('back-btn').addEventListener('click', navigateBack);
 document.getElementById('mode-btn').addEventListener('click', cycleMode);
