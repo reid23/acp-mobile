@@ -10,8 +10,10 @@ Discovers all live acp-multiplex sockets on the machine, groups them by project,
 
 ## Features
 
-- **Session discovery** — automatically finds all active acp-multiplex sockets, groups by project
+- **Session discovery** — automatically finds all active acp-multiplex sockets, groups by project, and shows whether each is working, needs input, or done
 - **Chat interface** — WebSocket bridge to any session with markdown rendering, streaming, tool call display
+- **Reliable over flaky connections** — keepalive pings, immediate reconnect when the page comes back into view, and prompts typed while disconnected or while the agent is busy are held and sent once it can take them
+- **Fast history** — only the most recent ~2 MB of a session is loaded (with oversized tool output shortened); "Load full history" fetches the rest
 - **File browser** — browse and view files from session working directories
 - **Auth** — random 256-bit authkey (generated on first run, stored in `~/.acp-mobile/authkey`)
 - **Security hardening** — CSRF protection, DNS rebinding protection, CSP headers, XSS-safe markdown
@@ -40,6 +42,14 @@ acp-mobile shows session names from acp-multiplex. To pass agent-shell buffer na
                              (cons name-var (plist-get args :environment-variables))))
                 (apply orig-fn args))))
 ```
+
+## Session state
+
+Sessions under a current acp-multiplex report their state exactly (see acp-multiplex's replay markers and `acp-multiplex/status`). For older acp-multiplex builds, acp-mobile infers it from history: a prompt with no turn end after it means working. After the history, the bridge sends the browser `acp-mobile/replay_end` with `{state, since, awaiting, legacy, omitted}`; the browser can send `acp-mobile/ping` and gets `acp-mobile/pong` back.
+
+## Spawning agents
+
+The `+` buttons run `agent-shell-spawn` (looked up in `extraPath` from `~/.acp-mobile/config.json`, then `PATH`). Under systemd, make sure the unit's `PATH` includes the directories holding `agent-shell-spawn` and `emacsclient`.
 
 ## Stopping acp-mobile
 

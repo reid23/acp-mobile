@@ -66,10 +66,25 @@ body {
   margin-top: 4px; background: #555;
 }
 .session-card.unread .sc-dot { background: #3fb950; }
+.session-card .sc-meta {
+  display: flex; align-items: center; gap: 8px; margin-top: 4px;
+}
 .session-card .sc-time {
-  font-size: 11px; color: #555; margin-top: 2px;
+  font-size: 11px; color: #555;
   font-family: "SF Mono", Menlo, monospace;
 }
+.session-card .sc-status {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 9px;
+}
+.sc-status.working { color: #58a6ff; background: rgba(88,166,255,0.13); }
+.sc-status.awaiting_input { color: #FF9800; background: rgba(255,152,0,0.15); }
+.sc-status.idle { color: #3fb950; background: rgba(63,185,80,0.12); }
+.sc-status.working::before, .sc-status.awaiting_input::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse { 50% { opacity: 0.25; } }
 .session-card .sc-info { flex: 1; min-width: 0; }
 .session-card .sc-name {
   font-size: 15px; font-weight: 600; color: #fff;
@@ -240,6 +255,24 @@ body {
 .msg.thought {
   background: transparent; color: #8b949e; font-style: italic;
   font-size: 13px; padding: 4px 16px; max-width: 100%;
+  white-space: pre-wrap;
+}
+.msg.thought.collapsed {
+  max-height: 4.6em; overflow: hidden; cursor: pointer;
+  -webkit-mask-image: linear-gradient(#000 55%, transparent);
+  mask-image: linear-gradient(#000 55%, transparent);
+}
+.msg.user.cancelled { opacity: 0.45; }
+.msg.user.failed { background: #5a1a1a; cursor: pointer; }
+.msg.user.failed .delivery { color: #f85149; }
+
+/* Notice above trimmed history */
+.history-omitted {
+  text-align: center; padding: 8px 12px 14px; color: #888; font-size: 12px;
+}
+.history-omitted button {
+  background: none; border: none; color: #007AFF; font-size: 13px;
+  cursor: pointer; padding: 4px;
 }
 
 /* System messages */
@@ -555,7 +588,23 @@ const basePath = location.pathname.replace(/\/$/, '');
 
 let ws, nextId = 100, sessionId = null;
 let currentAgentMsg = null;
+let currentThoughtMsg = null;
 let processing = false;
+// Session state from acp-multiplex: 'idle', 'working', 'awaiting_input'.
+// Older multiplexers don't report it (stateAuthoritative false); then it
+// is inferred from turn_complete and agent activity.
+let sessionState = '';
+let stateAuthoritative = false;
+// Prompts typed but not yet handed to the agent ({text, el}), and the one
+// sent and not yet answered ({text, el, id}).
+let outbox = [];
+let inflight = null;
+let fullHistory = false;
+// Set when the session's process is gone; stops automatic reconnects.
+let sessionGone = false;
+// Keepalive: the server answers acp-mobile/ping with acp-mobile/pong.
+const PING_EVERY = 25000;
+let lastMessageAt = 0, pingSentAt = 0, pongDeadline = 0;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let isAtBottom = true;
@@ -673,21 +722,49 @@ function addUserMsg(text, status) {
   d.className = 'msg user';
   d.id = 'msg-' + (++msgIdCounter);
   const time = formatTime(new Date());
-  const deliveryIcon = status === 'queued' ? '&#9201;' : status === 'sending' ? '&#9675;' : '&#10003;';
   d.innerHTML =
     '<span class="role">You</span>' +
     '<div class="text">' + escHtml(text) + '</div>' +
     '<div class="meta"><span class="time">' + time + '</span>' +
-    '<span class="delivery">' + deliveryIcon + '</span></div>';
+    '<span class="delivery"></span></div>';
+  setDelivery(d, status);
   d.addEventListener('contextmenu', (e) => { e.preventDefault(); copyText(text); });
   messagesEl.appendChild(d);
   if (isAtBottom) scrollToBottom();
   return d;
 }
 
-function markSent(el) {
+const DELIVERY = {
+  queued: ['\u23F1', 'Waiting to send'],
+  offline: ['\u23F1', 'Waiting for connection'],
+  sending: ['\u25CB', 'Sending'],
+  sent: ['\u2713', 'Delivered'],
+  failed: ['\u2717 tap to retry', 'Not delivered'],
+  cancelled: ['\u2717', 'Cancelled'],
+};
+
+function setDelivery(el, status) {
+  if (!el) return;
+  const [icon, title] = DELIVERY[status] || DELIVERY.sent;
   const delivery = el.querySelector('.delivery');
-  if (delivery) delivery.innerHTML = '&#10003;';
+  if (delivery) { delivery.textContent = icon; delivery.title = title; }
+  el.classList.toggle('failed', status === 'failed');
+  el.classList.toggle('cancelled', status === 'cancelled');
+}
+
+function wsOpen() {
+  return ws && ws.readyState === WebSocket.OPEN && !replayMode;
+}
+
+// Sends a JSON-RPC message if connected; otherwise says so and returns false.
+function wsSend(obj) {
+  if (!wsOpen()) {
+    showToast('Not connected \u2014 reconnecting');
+    reconnectNow();
+    return false;
+  }
+  ws.send(JSON.stringify(obj));
+  return true;
 }
 
 function addAgentMsg(text) {
@@ -884,7 +961,7 @@ function addErrorMsg(text) {
   return d;
 }
 
-function addPermissionMsg(msg, interactive) {
+function addPermissionMsg(msg, interactive, parent) {
   const params = msg.params || {};
   const tc = params.toolCall || {};
   const options = params.options || [];
@@ -960,10 +1037,10 @@ function addPermissionMsg(msg, interactive) {
       btn.onclick = () => {
         const optionId = btn.getAttribute('data-option-id');
         // Send response
-        ws.send(JSON.stringify({
+        if (!wsSend({
           jsonrpc: '2.0', id: msg.id,
           result: { outcome: { outcome: 'selected', optionId: optionId } }
-        }));
+        })) return;
         // Disable all buttons, highlight selected
         buttons.forEach(b => { b.disabled = true; });
         btn.classList.add('selected');
@@ -975,8 +1052,8 @@ function addPermissionMsg(msg, interactive) {
     pendingPermissions.push({ id: msg.id, element: d });
   }
 
-  messagesEl.appendChild(d);
-  if (isAtBottom) scrollToBottom();
+  (parent || messagesEl).appendChild(d);
+  if (!parent && isAtBottom) scrollToBottom();
   return d;
 }
 
@@ -1001,24 +1078,15 @@ function addPlanApprovalButtons(toolEl) {
     // Check if there's a pending permission we can respond to
     const pending = pendingPermissions.find(p => true); // any pending permission
     if (pending) {
-      const optionId = approved ? 'default' : (pending.element ? 'reject' : 'default');
-      ws.send(JSON.stringify({
+      if (!wsSend({
         jsonrpc: '2.0', id: pending.id,
         result: { outcome: { outcome: 'selected', optionId: approved ? 'default' : 'reject' } }
-      }));
+      })) return;
       pendingPermissions = pendingPermissions.filter(p2 => p2.id !== pending.id);
     } else {
       // No pending permission — send as a prompt
-      if (sessionId && ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({
-          jsonrpc: '2.0', id: Date.now(),
-          method: 'session/prompt',
-          params: {
-            sessionId: sessionId,
-            prompt: [{ type: 'text', text: approved ? 'Yes, proceed with the plan.' : 'No, reject the plan.' }]
-          }
-        }));
-      }
+      if (!sessionId) return;
+      enqueuePrompt(approved ? 'Yes, proceed with the plan.' : 'No, reject the plan.');
     }
     approveBtn.disabled = true;
     rejectBtn.disabled = true;
@@ -1080,11 +1148,47 @@ messagesEl.addEventListener('scroll', () => {
   scrollBtn.classList.toggle('visible', !isAtBottom);
 });
 
-function setProcessing(v) {
+function setProcessing(v, label) {
   processing = v;
   thinkingEl.classList.toggle('visible', v);
+  thinkingEl.querySelector('.label').textContent = label ||
+    (sessionState === 'awaiting_input' ? 'Waiting for your approval\u2026' : 'Agent is working\u2026');
   sendBtn.style.display = v ? 'none' : '';
   stopBtn.style.display = v ? 'flex' : 'none';
+  if (!v) setTimeout(pumpOutbox, 0);
+}
+
+// applyState takes the state from acp-multiplex (replay markers or
+// acp-multiplex/status), which is authoritative over guesses from traffic.
+function applyState(params) {
+  if (!params || !params.state) return;
+  sessionState = params.state;
+  setProcessing(sessionState !== 'idle');
+  if (sessionState !== 'idle') markDelivered();
+}
+
+function markDelivered() {
+  if (inflight && !inflight.delivered) {
+    inflight.delivered = true;
+    setDelivery(inflight.el, 'sent');
+  }
+}
+
+// noteActivity records agent output: proof an in-flight prompt arrived,
+// and (without authoritative state) a sign the agent is busy.
+function noteActivity() {
+  markDelivered();
+  if (!stateAuthoritative && !processing) setProcessing(true);
+}
+
+// noteTurnEnd handles turn_complete and prompt responses.
+function noteTurnEnd() {
+  currentAgentMsg = null;
+  currentThoughtMsg = null;
+  if (!stateAuthoritative) {
+    sessionState = 'idle';
+    setProcessing(false);
+  }
 }
 
 function updateModeBtn() {
@@ -1100,59 +1204,92 @@ function cycleMode() {
   const ids = availableModes.map(m => m.id);
   const idx = ids.indexOf(currentMode);
   const nextMode = ids[(idx + 1) % ids.length];
-  // Optimistic update
-  currentMode = nextMode;
-  updateModeBtn();
-  // Send to agent
-  ws.send(JSON.stringify({
+  if (!wsSend({
     jsonrpc: '2.0', id: nextId++,
     method: 'session/set_mode',
     params: { sessionId, modeId: nextMode }
-  }));
+  })) return;
+  // Optimistic update
+  currentMode = nextMode;
+  updateModeBtn();
 }
 
 // --- WebSocket & ACP protocol ---
 
 function connect(pid) {
+  if (ws) {
+    // Detach the old socket so its late events can't touch the new state.
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    try { ws.close(); } catch (e) {}
+  }
   replayMode = true;
   replayBuffer = [];
   clearTimeout(replayTimer);
+  statusText.textContent = 'Connecting\u2026';
+  statusText.className = 'header-status';
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let url = proto + '//' + location.host + basePath + '/ws';
-  if (pid) url += '?sock=' + pid;
+  const query = [];
+  if (pid) query.push('sock=' + pid);
+  if (fullHistory) query.push('history=all');
+  if (query.length) url += '?' + query.join('&');
 
-  ws = new WebSocket(url);
+  const sock = new WebSocket(url);
+  ws = sock;
+  lastMessageAt = Date.now();
+  pingSentAt = pongDeadline = 0;
 
-  ws.onopen = () => {
-    statusText.textContent = 'Connected';
-    statusText.className = 'header-status connected';
-    reconnectAttempts = 0;
+  sock.onopen = () => {
+    statusText.textContent = 'Loading\u2026';
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   };
 
-  ws.onmessage = (e) => {
+  sock.onmessage = (e) => {
+    lastMessageAt = Date.now();
+    pongDeadline = 0;
     const msg = JSON.parse(e.data);
+    if (msg.method === 'acp-mobile/pong') return;
     if (replayMode) {
+      // The server ends the replay with acp-mobile/replay_end. The timer
+      // only covers a replay that stalls and never finishes.
+      if (msg.method === 'acp-mobile/replay_end') {
+        clearTimeout(replayTimer);
+        flushReplay(msg.params || {});
+        return;
+      }
+      if (msg.id === null && msg.error) {
+        // The bridge couldn't reach the session: its process is gone.
+        sock.onclose = null;
+        sessionGone = true;
+        replayMode = false;
+        clearTimeout(replayTimer);
+        statusText.textContent = 'Session ended';
+        statusText.className = 'header-status error';
+        setProcessing(false);
+        const details = msg.error.data && msg.error.data.details;
+        addErrorMsg((msg.error.message || 'Session ended') + (details ? ': ' + details : ''));
+        return;
+      }
       replayBuffer.push(msg);
       clearTimeout(replayTimer);
-      replayTimer = setTimeout(flushReplay, 80);
+      replayTimer = setTimeout(() => flushReplay(null), 15000);
     } else {
       handleMessage(msg);
     }
   };
 
-  ws.onclose = () => {
-    statusText.textContent = 'Disconnected';
+  sock.onclose = () => {
+    statusText.textContent = 'Reconnecting\u2026';
     statusText.className = 'header-status error';
-    sendBtn.disabled = true;
-    setProcessing(false);
+    if (inflight && !inflight.delivered) setDelivery(inflight.el, 'offline');
+    for (const item of outbox) setDelivery(item.el, 'offline');
     if (chatViewEl && chatViewEl.classList.contains('visible')) {
       scheduleReconnect();
     }
   };
 
-  ws.onerror = () => {
+  sock.onerror = () => {
     statusText.textContent = 'Connection error';
     statusText.className = 'header-status error';
   };
@@ -1160,23 +1297,58 @@ function connect(pid) {
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  const delay = Math.min(60000, 2000 * Math.pow(2, reconnectAttempts));
+  const delay = Math.min(10000, 1000 * Math.pow(2, reconnectAttempts));
   reconnectAttempts++;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    messagesEl.innerHTML = '';
-    currentAgentMsg = null;
-    sessionId = null;
-    allReplayTurns = [];
-    pendingPermissions = [];
-    renderedTurnStart = 0;
-    if (currentSockPid) {
-      connect(String(currentSockPid));
-    } else {
-      connect();
-    }
+    connect(currentSockPid ? String(currentSockPid) : undefined);
   }, delay);
 }
+
+// reconnectNow skips the backoff, e.g. when the page comes back into view.
+function reconnectNow() {
+  if (!chatViewEl.classList.contains('visible')) return;
+  if (ws && ws.readyState === WebSocket.CONNECTING) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectAttempts = 0;
+  connect(currentSockPid ? String(currentSockPid) : undefined);
+}
+
+function sendPing(answerWithin) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  pingSentAt = Date.now();
+  pongDeadline = pingSentAt + answerWithin;
+  ws.send('{"jsonrpc":"2.0","method":"acp-mobile/ping"}');
+}
+
+// Pings keep idle connections from being dropped by the tunnel, and
+// notice connections that died silently (phone asleep, network change).
+setInterval(() => {
+  if (!chatViewEl.classList.contains('visible') || !ws) return;
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const now = Date.now();
+  if (pongDeadline && now > pongDeadline) {
+    reconnectNow();
+  } else if (!pongDeadline && now - lastMessageAt >= PING_EVERY) {
+    sendPing(10000);
+  }
+}, 5000);
+
+function onResume() {
+  if (document.visibilityState !== 'visible') return;
+  if (chatViewEl.classList.contains('visible')) {
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      reconnectNow();
+    } else if (ws.readyState === WebSocket.OPEN && !replayMode) {
+      sendPing(4000);
+    }
+  } else if (!navigatorEl.classList.contains('hidden')) {
+    loadSessions(true);
+  }
+}
+document.addEventListener('visibilitychange', onResume);
+window.addEventListener('online', onResume);
+window.addEventListener('pageshow', onResume);
 
 function toolType(update) {
   return (update._meta && update._meta.claudeCode && update._meta.claudeCode.toolName) || '';
@@ -1234,9 +1406,16 @@ function renderTurnBatch(turns, prepend) {
         fragment.appendChild(d);
         break;
       }
+      case 'thought':
+        fragment.appendChild(makeThoughtMsg(t.text, true));
+        break;
       case 'tool':
         lastToolEl = addToolMsgTo(fragment, t.toolName, t.toolParams, t.toolType);
         if (t.toolStatus) updateToolStatus(lastToolEl, t.toolStatus, t.toolContent);
+        if (t.toolCallId) {
+          if (!messagesEl._toolCalls) messagesEl._toolCalls = {};
+          messagesEl._toolCalls[t.toolCallId] = lastToolEl;
+        }
         // Pending ExitPlanMode: show plan approval buttons (unless a permission card follows)
         if (t.toolKind === 'switch_mode' && t.toolParams && t.toolParams.plan && !t.toolStatus) {
           const hasPermAfter = turns.slice(_ti + 1).some(t2 => t2.type === 'permission');
@@ -1246,18 +1425,9 @@ function renderTurnBatch(turns, prepend) {
       case 'tool_update':
         if (lastToolEl) updateToolStatus(lastToolEl, t.toolStatus, t.toolContent);
         break;
-      case 'permission': {
-        // Append batch so far, render permission (it appends to messagesEl),
-        // then start a new fragment for remaining turns
-        if (prepend) {
-          messagesEl.insertBefore(fragment, messagesEl.firstChild);
-        } else {
-          messagesEl.appendChild(fragment);
-        }
-        fragment = document.createDocumentFragment();
-        addPermissionMsg(t.msg, t.interactive || false);
+      case 'permission':
+        addPermissionMsg(t.msg, t.interactive || false, fragment);
         break;
-      }
       case 'error': {
         const d = document.createElement('div');
         d.className = 'msg error';
@@ -1270,10 +1440,34 @@ function renderTurnBatch(turns, prepend) {
     }
   }
   if (prepend) {
-    messagesEl.insertBefore(fragment, messagesEl.firstChild);
+    messagesEl.insertBefore(fragment, historyTop());
   } else {
     messagesEl.appendChild(fragment);
   }
+}
+
+// historyTop is where older history goes: the top of the list, but below
+// the "older messages not loaded" notice.
+function historyTop() {
+  const first = messagesEl.firstChild;
+  if (first && first.classList && first.classList.contains('history-omitted')) {
+    return first.nextSibling;
+  }
+  return first;
+}
+
+// makeThoughtMsg renders one block of agent reasoning. Long ones from
+// history start collapsed; tap toggles.
+function makeThoughtMsg(text, collapse) {
+  const d = document.createElement('div');
+  d.className = 'msg thought';
+  d.textContent = text.trim();
+  d._text = text;
+  if (collapse && text.length > 280) d.classList.add('collapsed');
+  d.onclick = () => {
+    if (d._text.length > 280) d.classList.toggle('collapsed');
+  };
+  return d;
 }
 
 // Like addToolMsg but appends to a given parent (DocumentFragment)
@@ -1345,7 +1539,7 @@ function showLoadMoreHint() {
     hint.textContent = 'Load earlier messages';
     hint.onclick = loadMoreHistory;
   }
-  messagesEl.insertBefore(hint, messagesEl.firstChild);
+  messagesEl.insertBefore(hint, historyTop());
 }
 
 function loadMoreHistory() {
@@ -1375,8 +1569,15 @@ function loadMoreHistory() {
 
 // Process all buffered replay messages at once, skipping intermediate renders.
 // Assembles agent chunks into complete messages, renders once per message turn.
-function flushReplay() {
+// end is the acp-mobile/replay_end params ({state, awaiting, omitted, legacy}),
+// or null if the replay stalled and never finished.
+function flushReplay(end) {
   replayMode = false;
+  sessionGone = false;
+  clearTimeout(replayTimer);
+  reconnectAttempts = 0;
+  statusText.textContent = 'Connected';
+  statusText.className = 'header-status connected';
   const msgs = replayBuffer;
   replayBuffer = [];
 
@@ -1384,7 +1585,7 @@ function flushReplay() {
   // and collect notification sequences into assembled turns.
   const turns = []; // {type, text, toolName, toolParams, toolStatus, toolContent}
   let pendingText = '';
-  let replayEnded = false; // true if we saw a stopReason or available_commands_update
+  let lastUserTurn = -1; // >= 0 while the last user message has no turn end after it
 
   for (const msg of msgs) {
     // Responses: handle silently for state (sessionId, modes, etc.)
@@ -1418,7 +1619,7 @@ function flushReplay() {
         }
       }
       if (msg.result && msg.result.stopReason) {
-        replayEnded = true;
+        lastUserTurn = -1;
         // Flush pending agent text as a turn
         if (pendingText) {
           turns.push({type: 'agent', text: pendingText});
@@ -1459,6 +1660,16 @@ function flushReplay() {
       case 'agent_message_chunk':
         pendingText += text;
         break;
+      case 'agent_thought_chunk': {
+        if (pendingText) {
+          turns.push({type: 'agent', text: pendingText});
+          pendingText = '';
+        }
+        const last = turns[turns.length - 1];
+        if (last && last.type === 'thought') last.text += text;
+        else if (text) turns.push({type: 'thought', text});
+        break;
+      }
       case 'tool_call': {
         const tcId = update.toolCallId;
         // Check if we already have a turn for this toolCallId — update it instead of adding duplicate
@@ -1521,13 +1732,10 @@ function flushReplay() {
         if (text) turns.push({type: 'user', text});
         break;
       case 'turn_complete':
-        replayEnded = true;
-        setProcessing(false);
+        lastUserTurn = -1;
         break;
       case 'available_commands_update':
-        replayEnded = true;
-        if (sessionId) sendBtn.disabled = false;
-        setProcessing(false);
+        lastUserTurn = -1;
         break;
       case 'current_mode_update':
         if (update.currentModeId) {
@@ -1536,30 +1744,31 @@ function flushReplay() {
         }
         break;
     }
+    if (kind === 'user_message_chunk') lastUserTurn = turns.length;
   }
   // Flush any remaining agent text
   if (pendingText) {
     turns.push({type: 'agent', text: pendingText});
   }
 
-  // Detect if agent is still processing at end of replay
-  // (no stopReason response and no available_commands_update seen at the end)
-  if (!replayEnded) {
-    setProcessing(true);
-  }
-
-  // If there's a pending permission in replay, mark it interactive.
-  // The cache only stores a permission while it's unanswered, so any
-  // permission found here is guaranteed to need interaction.
-  for (let i = turns.length - 1; i >= 0; i--) {
-    if (turns[i].type === 'permission') {
-      turns[i].interactive = true;
-      setProcessing(true);
-      break;
+  // Permission cards stay in history once answered; only those the
+  // server lists as still awaiting get buttons.
+  if (end) {
+    const awaiting = new Set((end.awaiting || []).map(id => JSON.stringify(id)));
+    for (const t of turns) {
+      if (t.type === 'permission') t.interactive = awaiting.has(JSON.stringify(t.msg.id));
     }
+  } else if (turns.length && turns[turns.length - 1].type === 'permission' && lastUserTurn >= 0) {
+    turns[turns.length - 1].interactive = true;
   }
 
   // Store all turns; render only the last chunk
+  messagesEl.innerHTML = '';
+  messagesEl._toolCalls = {};
+  messagesEl._lastTool = null;
+  currentAgentMsg = null;
+  currentThoughtMsg = null;
+  pendingPermissions = [];
   allReplayTurns = turns;
   const INITIAL_TURNS = 20;
   renderedTurnStart = Math.max(0, turns.length - INITIAL_TURNS);
@@ -1571,13 +1780,74 @@ function flushReplay() {
   if (renderedTurnStart > 0) {
     showLoadMoreHint();
   }
+  if (end && end.omitted > 0) showHistoryOmitted(end.omitted);
 
+  if (end && end.state) {
+    stateAuthoritative = !end.legacy;
+    applyState(end);
+  } else {
+    // Stalled replay: busy if the last user message has no turn end after it.
+    stateAuthoritative = false;
+    sessionState = lastUserTurn >= 0 ? 'working' : 'idle';
+    setProcessing(sessionState !== 'idle');
+  }
+  if (sessionId) sendBtn.disabled = false;
+
+  // Output of a turn still in progress continues the last block.
+  const last = messagesEl.lastElementChild;
+  if (sessionState !== 'idle' && last) {
+    if (last.classList.contains('thought')) {
+      currentThoughtMsg = last;
+      last.classList.remove('collapsed');
+    } else if (last.classList.contains('agent')) {
+      currentAgentMsg = last;
+    }
+  }
+
+  reconcileOutbox(turns);
   scrollToBottom();
+}
+
+// After a (re)connect: a prompt that was in flight either shows up in
+// the history (it arrived) or goes back to the front of the outbox.
+// Unsent prompts are redrawn below the history and sent when the agent
+// is free.
+function reconcileOutbox(turns) {
+  if (inflight) {
+    const recent = turns.filter(t => t.type === 'user').slice(-5).map(t => t.text.trim());
+    if (!inflight.delivered && !recent.includes(inflight.text.trim())) {
+      delete inflight.id;
+      outbox.unshift(inflight);
+    }
+    inflight = null;
+  }
+  for (const item of outbox) {
+    item.el = addUserMsg(item.text, 'queued');
+  }
+  pumpOutbox();
+}
+
+function showHistoryOmitted(count) {
+  const d = document.createElement('div');
+  d.className = 'history-omitted';
+  d.innerHTML = escHtml(count + ' older messages not loaded') + '<br>';
+  const btn = document.createElement('button');
+  btn.textContent = 'Load full history';
+  btn.onclick = () => {
+    btn.disabled = true;
+    btn.textContent = 'Loading\u2026';
+    fullHistory = true;
+    reconnectNow();
+  };
+  d.appendChild(btn);
+  messagesEl.insertBefore(d, messagesEl.firstChild);
 }
 
 function handleMessage(msg) {
   // Response
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+    const mine = inflight && msg.id === inflight.id ? inflight : null;
+    if (mine) inflight = null;
     if (msg.error) {
       let errText = msg.error.message || 'Unknown error';
       if (msg.error.data && msg.error.data.details) {
@@ -1587,7 +1857,16 @@ function handleMessage(msg) {
         errText += ' [' + msg.error.code + ']';
       }
       addErrorMsg(errText);
-      setProcessing(false);
+      if (mine) {
+        setDelivery(mine.el, 'failed');
+        mine.el.onclick = () => {
+          mine.el.onclick = null;
+          mine.el.remove();
+          enqueuePrompt(mine.text);
+        };
+        if (!stateAuthoritative) setProcessing(false);
+      }
+      pumpOutbox();
       return;
     }
 
@@ -1613,13 +1892,9 @@ function handleMessage(msg) {
       }
     }
 
-    if (msg.result && msg.result.stopReason) {
-      currentAgentMsg = null;
-      setProcessing(false);
-      // Mark last sent user message as delivered
-      if (lastSentMsg) { markSent(lastSentMsg); lastSentMsg = null; }
-      flushMessageQueue();
-    }
+    if (mine) setDelivery(mine.el, 'sent');
+    if (msg.result && msg.result.stopReason) noteTurnEnd();
+    pumpOutbox();
     return;
   }
 
@@ -1628,6 +1903,12 @@ function handleMessage(msg) {
     headerTitle.textContent = msg.params.name;
     currentBufferName = msg.params.name;
     document.getElementById('kill-btn').style.display = '';
+    return;
+  }
+
+  if (msg.method === 'acp-multiplex/status') {
+    stateAuthoritative = true;
+    applyState(msg.params);
     return;
   }
 
@@ -1646,7 +1927,8 @@ function handleMessage(msg) {
 
     switch (kind) {
       case 'agent_message_chunk':
-        setProcessing(true);
+        noteActivity();
+        currentThoughtMsg = null;
         if (!currentAgentMsg) {
           currentAgentMsg = addAgentMsg('');
         }
@@ -1655,17 +1937,25 @@ function handleMessage(msg) {
         break;
 
       case 'agent_thought_chunk': {
-        const d = document.createElement('div');
-        d.className = 'msg thought';
-        d.textContent = text;
-        messagesEl.appendChild(d);
+        noteActivity();
+        currentAgentMsg = null;
+        if (!text) break;
+        // Thoughts stream in small fragments; grow one block per stretch
+        // of thinking.
+        if (!currentThoughtMsg) {
+          currentThoughtMsg = makeThoughtMsg('', false);
+          messagesEl.appendChild(currentThoughtMsg);
+        }
+        currentThoughtMsg._text += text;
+        currentThoughtMsg.textContent = currentThoughtMsg._text.trimStart();
         if (isAtBottom) scrollToBottom();
         break;
       }
 
       case 'tool_call': {
         currentAgentMsg = null;
-        setProcessing(true);
+        currentThoughtMsg = null;
+        noteActivity();
         const tcId = update.toolCallId;
         // If we already have an element for this toolCallId, update it in place
         const existing = tcId && messagesEl._toolCalls && messagesEl._toolCalls[tcId];
@@ -1697,20 +1987,18 @@ function handleMessage(msg) {
 
       case 'user_message_chunk':
         currentAgentMsg = null;
+        currentThoughtMsg = null;
         if (text) addUserMsg(text, 'sent');
+        if (!stateAuthoritative) setProcessing(true);
         break;
 
       case 'turn_complete':
-        currentAgentMsg = null;
-        setProcessing(false);
-        if (lastSentMsg) { markSent(lastSentMsg); lastSentMsg = null; }
-        flushMessageQueue();
+        noteTurnEnd();
         break;
 
       case 'available_commands_update':
         if (sessionId) sendBtn.disabled = false;
-        setProcessing(false);
-        flushMessageQueue();
+        if (!stateAuthoritative) setProcessing(false);
         break;
 
       case 'current_mode_update':
@@ -1746,56 +2034,56 @@ function handleMessage(msg) {
 
 // --- User interaction ---
 
-let lastSentMsg = null;
-let messageQueue = [];
-
 function sendPrompt() {
   const text = promptEl.value.trim();
   if (!text || !sessionId) return;
 
   promptEl.value = '';
   promptEl.style.height = 'auto';
+  enqueuePrompt(text);
+}
 
-  if (processing) {
-    // Queue message for when agent finishes
-    messageQueue.push(text);
-    addUserMsg(text, 'queued');
+// Prompts wait in the outbox until the connection is up, history has
+// loaded and the agent is free, so none is lost to a dead socket or sent
+// into a turn that is still running.
+function enqueuePrompt(text) {
+  outbox.push({ text, el: addUserMsg(text, wsOpen() ? 'queued' : 'offline') });
+  scrollToBottom();
+  pumpOutbox();
+}
+
+function pumpOutbox() {
+  if (!outbox.length || inflight || replayMode) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    for (const item of outbox) setDelivery(item.el, 'offline');
+    if (!sessionGone) reconnectNow();
     return;
   }
-
-  sendPromptText(text);
-}
-
-function sendPromptText(text) {
+  if (processing || !sessionId) return;
+  const item = outbox.shift();
+  item.id = nextId++;
+  inflight = item;
+  setDelivery(item.el, 'sending');
   currentAgentMsg = null;
-  lastSentMsg = addUserMsg(text, 'sending');
-  setProcessing(true);
-
+  currentThoughtMsg = null;
   ws.send(JSON.stringify({
     jsonrpc: '2.0',
-    id: nextId++,
+    id: item.id,
     method: 'session/prompt',
-    params: { sessionId, prompt: [{ type: 'text', text }] }
+    params: { sessionId, prompt: [{ type: 'text', text: item.text }] }
   }));
-}
-
-function flushMessageQueue() {
-  if (messageQueue.length > 0) {
-    const text = messageQueue.shift();
-    // Message was already displayed when queued, just send it
-    currentAgentMsg = null;
-    setProcessing(true);
-    ws.send(JSON.stringify({
-      jsonrpc: '2.0',
-      id: nextId++,
-      method: 'session/prompt',
-      params: { sessionId, prompt: [{ type: 'text', text }] }
-    }));
-  }
+  setProcessing(true);
 }
 
 function cancelPrompt() {
   if (!sessionId) return;
+  for (const item of outbox) setDelivery(item.el, 'cancelled');
+  outbox = [];
+  if (!wsSend({
+    jsonrpc: '2.0',
+    method: 'session/cancel',
+    params: { sessionId }
+  })) return;
   // Cancel all pending permission requests
   for (const p of pendingPermissions) {
     ws.send(JSON.stringify({
@@ -1807,13 +2095,11 @@ function cancelPrompt() {
     btns.forEach(b => { b.disabled = true; });
   }
   pendingPermissions = [];
-  ws.send(JSON.stringify({
-    jsonrpc: '2.0',
-    method: 'session/cancel',
-    params: { sessionId }
-  }));
-  messageQueue = [];
-  setProcessing(false);
+  if (stateAuthoritative) {
+    thinkingEl.querySelector('.label').textContent = 'Stopping\u2026';
+  } else {
+    setProcessing(false);
+  }
   addSystemMsg('Cancelled');
 }
 
@@ -1995,10 +2281,33 @@ function timeAgo(ts) {
   return Math.floor(secs / 86400) + 'd';
 }
 
-async function loadSessions() {
-  navListEl.innerHTML = '<div id="nav-empty">Loading...</div>';
+let sessionsLoading = false;
+
+// loadSessions fetches the session list; silent refreshes keep the
+// current list on screen and ignore failures.
+async function loadSessions(silent) {
+  if (silent && sessionsLoading) return;
+  sessionsLoading = true;
+  try {
+    await loadSessionsOnce(silent);
+  } finally {
+    sessionsLoading = false;
+  }
+}
+
+// Keep the list's status pills current while it is on screen.
+setInterval(() => {
+  if (discoverMode && document.visibilityState === 'visible' &&
+      !navigatorEl.classList.contains('hidden')) {
+    loadSessions(true);
+  }
+}, 5000);
+
+async function loadSessionsOnce(silent) {
+  if (!silent) navListEl.innerHTML = '<div id="nav-empty">Loading...</div>';
   try {
     const resp = await fetch(basePath + '/api/sessions', { method: 'POST' });
+    if (silent && (!resp.ok || navigatorEl.classList.contains('hidden'))) return;
     if (!resp.ok) {
       // Not in discover mode -- single socket, go straight to chat
       discoverMode = false;
@@ -2015,6 +2324,7 @@ async function loadSessions() {
     discoverMode = true;
     renderSessions(sessions);
   } catch (err) {
+    if (silent) return;
     // /api/sessions not available -- single socket mode
     discoverMode = false;
     showChat();
@@ -2080,16 +2390,30 @@ function sessionDisplayName(s) {
   return (s.title || 'Claude Code') + ' Agent @ ' + proj;
 }
 
+function statusPill(s) {
+  if (!s.state) return '';
+  let label = 'Done';
+  if (s.state === 'working') {
+    const age = timeAgo(s.stateSince);
+    label = 'Working' + (age && age !== 'now' ? ' ' + age : '');
+  } else if (s.state === 'awaiting_input') {
+    label = 'Needs input';
+  }
+  return '<span class="sc-status ' + escHtml(s.state) + '">' + label + '</span>';
+}
+
 function makeSessionCard(s, name) {
   const unread = isUnread(s);
   const d = document.createElement('div');
   d.className = 'session-card' + (unread ? ' unread' : '');
+  const pill = statusPill(s);
+  const time = s.lastActivity ? '<span class="sc-time">' + timeAgo(s.lastActivity) + '</span>' : '';
   d.innerHTML =
     '<div class="sc-dot"></div>' +
     '<div class="sc-info">' +
       '<div class="sc-name">' + escHtml(name) + '</div>' +
       (s.cwd ? '<div class="sc-path">' + escHtml(shortPath(s.cwd)) + '</div>' : '') +
-      (s.lastActivity ? '<div class="sc-time">' + timeAgo(s.lastActivity) + '</div>' : '') +
+      (pill || time ? '<div class="sc-meta">' + pill + time + '</div>' : '') +
     '</div>';
   if (s.bufferName) {
     const del = document.createElement('button');
@@ -2102,12 +2426,32 @@ function makeSessionCard(s, name) {
   return d;
 }
 
+// confirmDropOutbox asks before discarding prompts that were never sent.
+function confirmDropOutbox() {
+  if (!outbox.length) return true;
+  const n = outbox.length;
+  if (!confirm(n + (n === 1 ? ' message has' : ' messages have') + ' not been sent yet. Discard?')) {
+    return false;
+  }
+  outbox = [];
+  return true;
+}
+
 function selectSession(session) {
+  if (session.pid !== currentSockPid) {
+    if (!confirmDropOutbox()) return;
+    inflight = null;
+  }
   markViewed(session.pid);
   currentSockPid = session.pid;
   messagesEl.innerHTML = '';
   currentAgentMsg = null;
+  currentThoughtMsg = null;
   sessionId = null;
+  sessionState = '';
+  stateAuthoritative = false;
+  fullHistory = false;
+  sessionGone = false;
   projectCwd = session.cwd || null;
   currentBufferName = session.bufferName || null;
   document.getElementById('kill-btn').style.display = currentBufferName ? '' : 'none';
@@ -2131,11 +2475,12 @@ function showChat() {
 }
 
 function showNavigator() {
+  if (currentSockPid) markViewed(currentSockPid);
   chatViewEl.classList.remove('visible');
   navigatorEl.classList.remove('hidden');
   // Disconnect current websocket
   if (ws) {
-    ws.onclose = null; // prevent reconnect
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; // prevent reconnect
     ws.close();
     ws = null;
   }
@@ -2143,10 +2488,13 @@ function showNavigator() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  replayMode = false;
+  clearTimeout(replayTimer);
   loadSessions();
 }
 
 function navigateBack() {
+  if (!confirmDropOutbox()) return;
   showNavigator();
 }
 
@@ -2211,6 +2559,8 @@ async function killSession() {
       alert('Kill failed: ' + data.error);
       return;
     }
+    outbox = [];
+    inflight = null;
     showNavigator();
   } catch (err) {
     alert('Kill failed: ' + err.message);
@@ -2262,7 +2612,7 @@ async function killSessionByName(bufferName) {
 // Wire up event listeners (no inline onclick for CSP compatibility)
 document.getElementById('sort-btn').addEventListener('click', toggleSort);
 document.getElementById('spawn-btn').addEventListener('click', spawnAgent);
-document.getElementById('refresh-btn').addEventListener('click', loadSessions);
+document.getElementById('refresh-btn').addEventListener('click', () => loadSessions());
 document.getElementById('back-btn').addEventListener('click', navigateBack);
 document.getElementById('mode-btn').addEventListener('click', cycleMode);
 document.getElementById('files-btn').addEventListener('click', openFileBrowser);

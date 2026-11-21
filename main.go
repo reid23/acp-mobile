@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -58,7 +59,23 @@ func loadConfig() config {
 
 // command creates an exec.Cmd with extra PATH directories from config.
 func command(name string, args ...string) *exec.Cmd {
-	cmd := exec.Command(name, args...)
+	return commandContext(context.Background(), name, args...)
+}
+
+func commandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
+	// exec.Command looks name up in our own PATH, not cmd.Env's, so the
+	// extra directories have to be searched here too.
+	path := name
+	if !strings.Contains(name, "/") {
+		for _, dir := range appConfig.ExtraPath {
+			p := filepath.Join(dir, name)
+			if info, err := os.Stat(p); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+				path = p
+				break
+			}
+		}
+	}
+	cmd := exec.CommandContext(ctx, path, args...)
 	if len(appConfig.ExtraPath) > 0 {
 		env := os.Environ()
 		extra := strings.Join(appConfig.ExtraPath, ":")
@@ -509,6 +526,9 @@ type sessionInfo struct {
 	Project      string `json:"project,omitempty"`
 	BufferName   string `json:"bufferName,omitempty"`
 	LastActivity int64  `json:"lastActivity"` // unix timestamp
+	// idle, working or awaiting_input; empty if the probe didn't finish.
+	State      string `json:"state,omitempty"`
+	StateSince int64  `json:"stateSince,omitempty"`
 }
 
 func handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -539,7 +559,7 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 			done := make(chan struct{})
 			var info sessionInfo
 			go func() {
-				info = probeSocket(sock.path, sock.pid)
+				info = probeSocket(sock.path, sock.pid, sock.mtime)
 				close(done)
 			}()
 			select {
@@ -593,7 +613,12 @@ func handleSpawn(w http.ResponseWriter, r *http.Request) {
 		args = append(args, req.Task)
 	}
 
-	out, err := command("agent-shell-spawn", args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	out, err := commandContext(ctx, "agent-shell-spawn", args...).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		err = fmt.Errorf("timed out waiting for Emacs")
+	}
 	if err != nil {
 		log.Printf("spawn: %v: %s", err, out)
 		w.Header().Set("Content-Type", "application/json")
@@ -657,7 +682,28 @@ func handleKill(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-func probeSocket(sockPath string, pid int) sessionInfo {
+// Older multiplexers have to replay their whole history for us to infer
+// the session state, so those probes are cached until the socket's mtime
+// (touched on agent activity) changes.
+var legacyProbes = struct {
+	sync.Mutex
+	m map[int]legacyProbe
+}{m: map[int]legacyProbe{}}
+
+type legacyProbe struct {
+	mtime int64
+	at    time.Time
+	info  sessionInfo
+}
+
+func probeSocket(sockPath string, pid int, mtime int64) sessionInfo {
+	legacyProbes.Lock()
+	cached, ok := legacyProbes.m[pid]
+	legacyProbes.Unlock()
+	if ok && cached.mtime == mtime && time.Since(cached.at) < time.Minute {
+		return cached.info
+	}
+
 	info := sessionInfo{Pid: pid}
 
 	info.Cwd = processCwd(pid)
@@ -670,94 +716,78 @@ func probeSocket(sockPath string, pid int) sessionInfo {
 		return info
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
 
-	// Read raw bytes instead of scanning lines — much faster for large replays.
-	// We only need the first ~2 response messages (initialize + session/new).
-	buf := make([]byte, 64*1024)
-	var data []byte
-	gotSessionID := false
-	gotTitle := false
+	lines, st, err := readReplay(newLineReader(conn), 2*time.Second, true)
+	if err == nil {
+		info.State = st.State
+		info.StateSince = st.Since
+	}
 
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			data = append(data, buf[:n]...)
-			// Parse complete lines we have so far
-			for {
-				nl := bytes.IndexByte(data, '\n')
-				if nl < 0 {
-					break
-				}
-				line := data[:nl]
-				data = data[nl+1:]
+	for _, line := range lines {
+		var msg struct {
+			Result json.RawMessage `json:"result"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if json.Unmarshal(line, &msg) != nil {
+			continue
+		}
 
-				if len(line) == 0 {
-					continue
-				}
+		// Check for acp-multiplex/meta notification
+		if msg.Method == "acp-multiplex/meta" && msg.Params != nil {
+			var meta struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(msg.Params, &meta) == nil && meta.Name != "" {
+				info.BufferName = meta.Name
+			}
+			continue
+		}
 
-				var msg struct {
-					Result json.RawMessage `json:"result"`
-					Method string          `json:"method"`
-					Params json.RawMessage `json:"params"`
-				}
-				if json.Unmarshal(line, &msg) != nil {
-					continue
-				}
+		if msg.Method != "" {
+			break // past the header
+		}
+		if msg.Result == nil {
+			continue
+		}
 
-				// Check for acp-multiplex/meta notification
-				if msg.Method == "acp-multiplex/meta" && msg.Params != nil {
-					var meta struct {
-						Name string `json:"name"`
-					}
-					if json.Unmarshal(msg.Params, &meta) == nil && meta.Name != "" {
-						info.BufferName = meta.Name
-					}
-					continue
-				}
+		var res struct {
+			AgentInfo *struct {
+				Title string `json:"title"`
+				Name  string `json:"name"`
+			} `json:"agentInfo"`
+			SessionID string `json:"sessionId"`
+			Cwd       string `json:"cwd"`
+		}
+		if json.Unmarshal(msg.Result, &res) != nil {
+			continue
+		}
 
-				if msg.Result == nil {
-					continue
-				}
-
-				var res struct {
-					AgentInfo *struct {
-						Title string `json:"title"`
-						Name  string `json:"name"`
-					} `json:"agentInfo"`
-					SessionID string `json:"sessionId"`
-					Cwd       string `json:"cwd"`
-				}
-				if json.Unmarshal(msg.Result, &res) != nil {
-					continue
-				}
-
-				if res.AgentInfo != nil {
-					info.Title = res.AgentInfo.Title
-					if info.Title == "" {
-						info.Title = res.AgentInfo.Name
-					}
-					gotTitle = true
-				}
-				if res.SessionID != "" {
-					info.SessionID = res.SessionID
-					gotSessionID = true
-				}
-				if res.Cwd != "" {
-					info.Cwd = res.Cwd
-					info.Project = filepath.Base(info.Cwd)
-				}
-
-				if gotSessionID && gotTitle && info.BufferName != "" {
-					return info
-				}
+		if res.AgentInfo != nil {
+			info.Title = res.AgentInfo.Title
+			if info.Title == "" {
+				info.Title = res.AgentInfo.Name
 			}
 		}
-		if err != nil {
-			break
+		if res.SessionID != "" && info.SessionID == "" {
+			info.SessionID = res.SessionID
+		}
+		if res.Cwd != "" {
+			info.Cwd = res.Cwd
+			info.Project = filepath.Base(info.Cwd)
 		}
 	}
 
+	if st.Legacy && err == nil {
+		legacyProbes.Lock()
+		legacyProbes.m[pid] = legacyProbe{mtime: mtime, at: time.Now(), info: info}
+		for p := range legacyProbes.m {
+			if syscall.Kill(p, 0) != nil {
+				delete(legacyProbes.m, p)
+			}
+		}
+		legacyProbes.Unlock()
+	}
 	return info
 }
 
@@ -878,69 +908,91 @@ func jsonRPCError(id json.RawMessage, code int, message string) []byte {
 
 // --- WebSocket bridge ---
 
+const (
+	// The page pings every 25s; a connection silent for longer than this
+	// is dead (e.g. a phone that went to sleep) and is dropped.
+	wsIdleTimeout = 90 * time.Second
+	// A write stuck this long means the browser stopped reading.
+	wsWriteTimeout = 30 * time.Second
+	// Newer acp-multiplex builds mark the end of the replay; this only
+	// guards against one that never finishes.
+	replayTimeout = 30 * time.Second
+)
+
 // bridgeWebSocket connects to the proxy socket and bridges to the browser.
-// Reads the replay, keeping only responses and the last N notifications,
-// then forwards live traffic.
+// It sends the (trimmed) replay followed by acp-mobile/replay_end, which
+// carries the session state, then forwards live traffic.
 func bridgeWebSocket(ws *websocket.Conn, sockPath string) {
+	var wmu sync.Mutex
+	send := func(msg []byte) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		return websocket.Message.Send(ws, string(msg))
+	}
+	sendError := func(message string, err error) {
+		b, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0", "id": nil,
+			"error": map[string]interface{}{
+				"code": -32000, "message": message,
+				"data": map[string]string{"details": err.Error()},
+			},
+		})
+		send(b)
+	}
+
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
 		log.Printf("ws: connect to %s: %v", sockPath, err)
-		errMsg := fmt.Sprintf(`{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Connection failed","data":{"details":"%s"}}}`, strings.ReplaceAll(err.Error(), `"`, `\"`))
-		websocket.Message.Send(ws, errMsg)
+		sendError("Connection failed", err)
 		ws.Close()
 		return
 	}
 	defer conn.Close()
+	var cmu sync.Mutex
+	writeSock := func(line []byte) error {
+		cmu.Lock()
+		defer cmu.Unlock()
+		_, err := conn.Write(append(line[:len(line):len(line)], '\n'))
+		return err
+	}
 
-	// Read the replay into memory using a short idle timeout to detect
-	// when the replay burst is done (no explicit end marker from the proxy).
-	var responses [][]byte
-	var notifications [][]byte
-
-	buf := make([]byte, 0, 64*1024)
-	tmp := make([]byte, 256*1024)
-
-	for {
-		// Short deadline: if no data arrives within 150ms, replay is done.
-		conn.SetDeadline(time.Now().Add(150 * time.Millisecond))
-		n, err := conn.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			for {
-				nl := bytes.IndexByte(buf, '\n')
-				if nl < 0 {
-					break
-				}
-				line := make([]byte, nl)
-				copy(line, buf[:nl])
-				buf = buf[nl+1:]
-				if len(line) == 0 {
-					continue
-				}
-				if bytes.Contains(line, []byte(`"result"`)) || bytes.Contains(line, []byte(`"error"`)) {
-					responses = append(responses, line)
-				} else {
-					notifications = append(notifications, line)
-				}
-			}
-		}
-		if err != nil {
-			break // timeout or EOF — replay is done
+	r := newLineReader(conn)
+	lines, st, err := readReplay(r, replayTimeout, false)
+	if err != nil && !isTimeout(err) {
+		log.Printf("ws: replay from %s: %v", sockPath, err)
+		sendError("Session ended", err)
+		ws.Close()
+		return
+	}
+	total := len(lines)
+	omitted := 0
+	if ws.Request().URL.Query().Get("history") != "all" {
+		lines, omitted = trimReplay(lines, replayBudget)
+	}
+	for _, line := range lines {
+		if err := send(line); err != nil {
+			log.Printf("ws: send replay: %v", err)
+			ws.Close()
+			return
 		}
 	}
-
-	conn.SetDeadline(time.Time{})
-
-	// Send full replay: all responses + all notifications
-	for _, line := range responses {
-		websocket.Message.Send(ws, string(line))
+	end, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "acp-mobile/replay_end",
+		"params": map[string]interface{}{
+			"state":    st.State,
+			"since":    st.Since,
+			"awaiting": st.Awaiting,
+			"legacy":   st.Legacy,
+			"omitted":  omitted,
+		},
+	})
+	if err := send(end); err != nil {
+		ws.Close()
+		return
 	}
-	for _, line := range notifications {
-		websocket.Message.Send(ws, string(line))
-	}
-
-	log.Printf("ws: replay %d responses + %d notifications",
-		len(responses), len(notifications))
+	log.Printf("ws: replayed %d of %d messages, state %s", len(lines), total, st.State)
 
 	// Bridge live traffic
 	var once sync.Once
@@ -952,6 +1004,7 @@ func bridgeWebSocket(ws *websocket.Conn, sockPath string) {
 	go func() {
 		defer once.Do(closeAll)
 		for {
+			ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
 			var msg string
 			if err := websocket.Message.Receive(ws, &msg); err != nil {
 				if err != io.EOF {
@@ -959,55 +1012,38 @@ func bridgeWebSocket(ws *websocket.Conn, sockPath string) {
 				}
 				return
 			}
-			conn.Write([]byte(msg))
-			conn.Write([]byte("\n"))
+			if strings.Contains(msg, `"acp-mobile/ping"`) && lineMethod([]byte(msg)) == "acp-mobile/ping" {
+				if send([]byte(`{"jsonrpc":"2.0","method":"acp-mobile/pong"}`)) != nil {
+					return
+				}
+				continue
+			}
+			if err := writeSock([]byte(msg)); err != nil {
+				log.Printf("ws: write to socket: %v", err)
+				return
+			}
 		}
 	}()
 
-	func() {
-		defer once.Do(closeAll)
-		// forwardOrHandle checks if a line is a reverse call we handle locally.
-		// If so, sends the response back to the socket. Otherwise forwards to browser.
-		forwardOrHandle := func(line []byte) {
-			if resp := handleReverseCall(line); resp != nil {
-				conn.Write(resp)
-				conn.Write([]byte("\n"))
-				return
+	defer once.Do(closeAll)
+	for {
+		line, err := r.next(time.Time{})
+		if err != nil {
+			if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+				log.Printf("ws sock read: %v", err)
 			}
-			websocket.Message.Send(ws, string(line))
+			return
 		}
-		// Flush leftover bytes from replay read
-		for {
-			nl := bytes.IndexByte(buf, '\n')
-			if nl < 0 {
-				break
-			}
-			if nl > 0 {
-				forwardOrHandle(buf[:nl])
-			}
-			buf = buf[nl+1:]
+		// Reverse calls we can answer locally go straight back.
+		if resp := handleReverseCall(line); resp != nil {
+			writeSock(resp)
+			continue
 		}
-		for {
-			n, err := conn.Read(tmp)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("ws sock read: %v", err)
-				}
-				return
-			}
-			buf = append(buf, tmp[:n]...)
-			for {
-				nl := bytes.IndexByte(buf, '\n')
-				if nl < 0 {
-					break
-				}
-				if nl > 0 {
-					forwardOrHandle(buf[:nl])
-				}
-				buf = buf[nl+1:]
-			}
+		if err := send(line); err != nil {
+			log.Printf("ws send: %v", err)
+			return
 		}
-	}()
+	}
 }
 
 // --- File browser ---
