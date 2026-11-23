@@ -228,7 +228,7 @@ func main() {
 			fmt.Sprintf("default-src 'self'; script-src 'nonce-%s'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'", nonce))
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(bytes.Replace(indexHTML, []byte("__CSP_NONCE__"), []byte(nonce), 1))
+		w.Write(bytes.ReplaceAll(indexHTML, []byte("__CSP_NONCE__"), []byte(nonce)))
 	})
 
 	mux.Handle("/ws", &websocket.Server{
